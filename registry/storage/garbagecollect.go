@@ -34,12 +34,23 @@ type ManifestDel struct {
 // MarkAndSweep performs a mark and sweep of registry data
 func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, registry distribution.Namespace, opts GCOpts) error {
 
-	deleteBlobSet, deleteManifestArr, deleteRepositoryArr, err := mark(ctx, storageDriver, registry, opts.RemoveUntagged, opts.ModificationTimeout)
+	deleteBlobSet, deleteManifestArr, deleteLayerMap, deleteRepositoryArr, err := mark(ctx, storageDriver, registry, opts.RemoveUntagged, opts.ModificationTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to mark blobs and manifests: %v", err)
 	}
 
-	emit("\n%d blobs, %d manifests, %d repositories eligible for deletion", len(deleteBlobSet), len(deleteManifestArr), len(deleteRepositoryArr))
+	deleteLayerCount := 0
+	for k := range deleteLayerMap {
+		deleteLayerCount = deleteLayerCount + len(deleteLayerMap[k])
+	}
+
+	emit(
+		"\n%d blobs, %d manifests, %layers, %d repositories eligible for deletion",
+		len(deleteBlobSet),
+		len(deleteManifestArr),
+		deleteLayerCount,
+		len(deleteRepositoryArr),
+	)
 
 	vacuum := NewVacuum(ctx, storageDriver)
 
@@ -49,6 +60,8 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 			return fmt.Errorf("failed to sweep manifests: %v", err)
 		}
 	}
+
+	sweepLayers(vacuum, deleteLayerMap, opts.DryRun)
 
 	if opts.RemoveRepositories {
 		err = sweepRepositories(vacuum, deleteRepositoryArr, opts.DryRun)
@@ -74,7 +87,36 @@ func sweepRepositories(vacuum Vacuum, deleteRepositoryArr []string, dryRun bool)
 		}
 		err := vacuum.RemoveRepository(name)
 		if err != nil {
-			return fmt.Errorf("failed to delete repository %s: %v", name, err)
+			switch err := err.(type) {
+			case driver.PathNotFoundError:
+				emit("skip error: %v", err)
+				continue
+			default:
+				return fmt.Errorf("failed to delete repository %s: %v", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+func sweepLayers(vacuum Vacuum, deleteLayerMap map[string][]digest.Digest, dryRun bool) error {
+	emit("sweep layers")
+	for repoName, layerArr := range deleteLayerMap {
+		for _, dgst := range layerArr {
+			emit("layer eligible for deletion: %s %s", repoName, dgst)
+			if dryRun {
+				continue
+			}
+			err := vacuum.RemoveLayer(repoName, dgst)
+			if err != nil {
+				switch err := err.(type) {
+				case driver.PathNotFoundError:
+					emit("skip error: %v", err)
+					continue
+				default:
+					return fmt.Errorf("failed to delete layer %s: %v", dgst, err)
+				}
+			}
 		}
 	}
 	return nil
@@ -89,7 +131,13 @@ func sweepBlobs(vacuum Vacuum, deleteBlobSet map[digest.Digest]struct{}, dryRun 
 		}
 		err := vacuum.RemoveBlob(string(dgst))
 		if err != nil {
-			return fmt.Errorf("failed to delete blob %s: %v", dgst, err)
+			switch err := err.(type) {
+			case driver.PathNotFoundError:
+				emit("skip error: %v", err)
+				continue
+			default:
+				return fmt.Errorf("failed to delete blob %s: %v", dgst, err)
+			}
 		}
 	}
 	return nil
@@ -104,7 +152,13 @@ func sweepManifests(vacuum Vacuum, deleteManifestArr []ManifestDel, dryRun bool)
 		}
 		err := vacuum.RemoveManifest(obj.Name, obj.Digest, obj.Tags)
 		if err != nil {
-			return fmt.Errorf("failed to delete manifest %s: %v", obj.Digest, err)
+			switch err := err.(type) {
+			case driver.PathNotFoundError:
+				emit("skip error: %v", err)
+				continue
+			default:
+				return fmt.Errorf("failed to delete manifest %s: %v", obj.Digest, err)
+			}
 		}
 	}
 	return nil
@@ -116,16 +170,16 @@ func mark(
 	registry distribution.Namespace,
 	removeUntagged bool,
 	modificationTimeout float64,
-) (map[digest.Digest]struct{}, []ManifestDel, []string, error) {
+) (map[digest.Digest]struct{}, []ManifestDel, map[string][]digest.Digest, []string, error) {
 	repositoryEnumerator, ok := registry.(distribution.RepositoryEnumerator)
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("unable to convert Namespace to RepositoryEnumerator")
+		return nil, nil, nil, nil, fmt.Errorf("unable to convert Namespace to RepositoryEnumerator")
 	}
 
-	// mark
 	markBlobSet := make(map[digest.Digest]struct{})
 	deleteManifestArr := make([]ManifestDel, 0)
 	deleteRepositoryArr := make([]string, 0)
+	deleteLayerMap := make(map[string][]digest.Digest)
 
 	err := repositoryEnumerator.Enumerate(ctx, func(repoName string) error {
 		emit(repoName)
@@ -151,6 +205,7 @@ func mark(
 			return fmt.Errorf("unable to convert ManifestService into ManifestEnumerator")
 		}
 
+		markRepoBlobSet := make(map[digest.Digest]struct{})
 		err = manifestEnumerator.Enumerate(ctx, func(dgst digest.Digest) error {
 			if removeUntagged {
 				// fetch all tags where this manifest is the latest one
@@ -193,6 +248,7 @@ func mark(
 			descriptors := manifest.References()
 			for _, descriptor := range descriptors {
 				markBlobSet[descriptor.Digest] = struct{}{}
+				markRepoBlobSet[descriptor.Digest] = struct{}{}
 				emit("%s: marking blob %s", repoName, descriptor.Digest)
 			}
 
@@ -210,6 +266,28 @@ func mark(
 			return nil
 		}
 
+		// mark layer for deletion
+		blobStore := repository.Blobs(ctx)
+		blobEnumerator, ok := blobStore.(distribution.BlobEnumerator)
+		if !ok {
+			return fmt.Errorf("unable to convert blobStore into blobEnumerator")
+		}
+
+		deleteLayerArr := make([]digest.Digest, 0)
+		err = blobEnumerator.Enumerate(ctx, func(dgst digest.Digest) error {
+			if _, ok := markRepoBlobSet[dgst]; !ok {
+				emit("%s: unused layer %s", repoName, dgst)
+				deleteLayerArr = append(deleteLayerArr, dgst)
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("failed to get layers %v", err)
+		}
+		if len(deleteLayerArr) > 0 {
+			deleteLayerMap[repoName] = deleteLayerArr
+		}
+
 		if !repoHasManifest {
 			modifiedEarlier, err := repositoryModifiedEarlierThan(ctx, storageDriver, repoName, modificationTimeout)
 			if err != nil {
@@ -224,7 +302,7 @@ func mark(
 	})
 
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to mark: %v", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to mark: %v", err)
 	}
 
 	blobService := registry.Blobs()
@@ -245,13 +323,12 @@ func mark(
 		return nil
 	})
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("error enumerating blobs: %v", err)
+		return nil, nil, nil, nil, fmt.Errorf("error enumerating blobs: %v", err)
 	}
 
-	return deleteBlobSet, deleteManifestArr, deleteRepositoryArr, nil
+	return deleteBlobSet, deleteManifestArr, deleteLayerMap, deleteRepositoryArr, nil
 }
 
-// RepositoryModifiedEarlierThan returns repository was modified more than timeout seconds ago
 func repositoryModifiedEarlierThan(
 	ctx context.Context,
 	strorageDriver driver.StorageDriver,
@@ -266,7 +343,6 @@ func repositoryModifiedEarlierThan(
 	return pathModifiedEarlierThan(ctx, strorageDriver, repoDir, timeout)
 }
 
-// manifestModifiedEarlierThan returns manifest was modified more than timeout seconds ago
 func manifestModifiedEarlierThan(
 	ctx context.Context,
 	strorageDriver driver.StorageDriver,
@@ -277,7 +353,6 @@ func manifestModifiedEarlierThan(
 	return pathSpecModifiedEarlierThan(ctx, strorageDriver, manifestRevisionPathSpec{name: repoName, revision: revision}, timeout)
 }
 
-// blobModifiedEarlierThan returns blob was modified more than timeout seconds ago
 func blobModifiedEarlierThan(
 	ctx context.Context,
 	strorageDriver driver.StorageDriver,
@@ -287,7 +362,6 @@ func blobModifiedEarlierThan(
 	return pathSpecModifiedEarlierThan(ctx, strorageDriver, blobPathSpec{digest: digest}, timeout)
 }
 
-// pathSpecModifiedEarlierThan returns pathSpec file was modified more than timeout seconds ago
 func pathSpecModifiedEarlierThan(
 	ctx context.Context,
 	strorageDriver driver.StorageDriver,
@@ -301,7 +375,6 @@ func pathSpecModifiedEarlierThan(
 	return pathModifiedEarlierThan(ctx, strorageDriver, path, timeout)
 }
 
-// pathModifiedEarlierThan returns path was modified more than timeout seconds ago
 func pathModifiedEarlierThan(ctx context.Context, strorageDriver driver.StorageDriver, path string, timeout float64) (bool, error) {
 	if timeout <= 0 {
 		return true, nil

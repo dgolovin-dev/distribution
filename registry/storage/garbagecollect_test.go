@@ -93,6 +93,24 @@ func allBlobs(t *testing.T, registry distribution.Namespace) map[digest.Digest]s
 	return allBlobsMap
 }
 
+func allLayers(t *testing.T, repo distribution.Repository) map[digest.Digest]struct{} {
+	ctx := context.Background()
+	repoBlobStore := repo.Blobs(ctx)
+	blobEnumerator, ok := repoBlobStore.(distribution.BlobEnumerator)
+	if !ok {
+		t.Fatalf("unable to convert blobStore into blobEnumerator")
+	}
+	allLayersMap := make(map[digest.Digest]struct{})
+	err := blobEnumerator.Enumerate(ctx, func(dgst digest.Digest) error {
+		allLayersMap[dgst] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Error getting all layers: %v", err)
+	}
+	return allLayersMap
+}
+
 func uploadImage(t *testing.T, repository distribution.Repository, im image) digest.Digest {
 	// upload layers
 	err := testutil.UploadBlobs(repository, im.layers)
@@ -554,6 +572,7 @@ func testModificationTimeout(t *testing.T, dryRun bool, removeUntagged bool, rem
 
 	before1 := allBlobs(t, registry)
 	before2 := allManifests(t, manifestService)
+	before3 := allLayers(t, repo)
 
 	time.Sleep(10 * time.Millisecond)
 	preparationCompleteTime := time.Now()
@@ -606,8 +625,10 @@ func testModificationTimeout(t *testing.T, dryRun bool, removeUntagged bool, rem
 
 	after1 := allBlobs(t, registry)
 	after2 := make(map[digest.Digest]struct{})
+	after3 := make(map[digest.Digest]struct{})
 	if repoExists {
 		after2 = allManifests(t, manifestService)
+		after3 = allLayers(t, repo)
 	}
 	if dryRun {
 		if len(after1) != len(before1) {
@@ -616,12 +637,18 @@ func testModificationTimeout(t *testing.T, dryRun bool, removeUntagged bool, rem
 		if len(after2) != len(before2) {
 			t.Fatalf("Manifests were affected: %d != %d", len(after2), len(before2))
 		}
+		if len(after3) != len(before3) {
+			t.Fatalf("Layers were affected: %d != %d", len(after3), len(before3))
+		}
 	} else if !removeUntagged {
-		if len(after1) == len(randomLayers1) {
+		if len(after1) != len(randomLayers1)+len(before2) {
 			t.Fatalf("Blobs count incorrect: %d != %d", len(after1), len(randomLayers1))
 		}
-		if len(after2) != len(before2) {
+		if len(after2) == 0 {
 			t.Fatalf("Manifest was deleted")
+		}
+		if len(after3) != len(randomLayers1) {
+			t.Fatalf("Layers count incorrect: %d != %d", len(after3), len(randomLayers1))
 		}
 	} else {
 		if len(after1) != 0 {
@@ -630,7 +657,9 @@ func testModificationTimeout(t *testing.T, dryRun bool, removeUntagged bool, rem
 		if len(after2) != 0 {
 			t.Fatalf("Manifests was not deleted")
 		}
-
+		if len(after2) != 0 {
+			t.Fatalf("Layer was not deleted")
+		}
 	}
 }
 
