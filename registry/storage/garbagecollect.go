@@ -54,7 +54,7 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 	if opts.RemoveRepositories {
 		err = sweepRepositories(vacuum, deleteRepositoryArr, opts.DryRun)
 		if err != nil {
-			return fmt.Errorf("failed to sweep manifests: %v", err)
+			return fmt.Errorf("failed to sweep repositories: %v", err)
 		}
 	}
 
@@ -67,6 +67,7 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 }
 
 func sweepRepositories(vacuum Vacuum, deleteRepositoryArr []string, dryRun bool) error {
+	emit("sweep repositories")
 	for _, name := range deleteRepositoryArr {
 		emit("repository eligible for deletion: %s", name)
 		if dryRun {
@@ -81,6 +82,7 @@ func sweepRepositories(vacuum Vacuum, deleteRepositoryArr []string, dryRun bool)
 }
 
 func sweepBlobs(vacuum Vacuum, deleteBlobSet map[digest.Digest]struct{}, dryRun bool) error {
+	emit("sweep blobs")
 	for dgst := range deleteBlobSet {
 		emit("blob eligible for deletion: %s", dgst)
 		if dryRun {
@@ -95,6 +97,7 @@ func sweepBlobs(vacuum Vacuum, deleteBlobSet map[digest.Digest]struct{}, dryRun 
 }
 
 func sweepManifests(vacuum Vacuum, deleteManifestArr []ManifestDel, dryRun bool) error {
+	emit("sweep manifests")
 	for _, obj := range deleteManifestArr {
 		emit("manifest eligible for deletion: %s %s", obj.Name, obj.Digest)
 		if dryRun {

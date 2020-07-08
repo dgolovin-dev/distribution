@@ -19,7 +19,7 @@ func init() {
 	RootCmd.AddCommand(GCCmd)
 	GCCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "do everything except remove the blobs")
 	GCCmd.Flags().BoolVarP(&removeUntagged, "delete-untagged", "m", false, "delete manifests that are not currently referenced via tag")
-	GCCmd.Flags().BoolVarP(&removeUntagged, "delete-repositories", "r", false, "delete repositories without manifests")
+	GCCmd.Flags().BoolVarP(&removeRepositories, "delete-repositories", "r", false, "delete repositories without manifests")
 	GCCmd.Flags().Float64VarP(&modificationTimeout, "modification-timeout", "t", 0, "don't remove blobs and manfiests modified less than this seconds ago")
 	RootCmd.Flags().BoolVarP(&showVersion, "version", "v", false, "show the version and exit")
 }
