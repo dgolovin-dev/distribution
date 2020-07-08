@@ -3,6 +3,8 @@ package storage
 import (
 	"context"
 	"fmt"
+	"path"
+	"time"
 
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/reference"
@@ -16,8 +18,10 @@ func emit(format string, a ...interface{}) {
 
 // GCOpts contains options for garbage collector
 type GCOpts struct {
-	DryRun         bool
-	RemoveUntagged bool
+	DryRun              bool
+	RemoveUntagged      bool
+	RemoveRepositories  bool
+	ModificationTimeout float64
 }
 
 // ManifestDel contains manifest structure which will be deleted
@@ -29,17 +33,102 @@ type ManifestDel struct {
 
 // MarkAndSweep performs a mark and sweep of registry data
 func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, registry distribution.Namespace, opts GCOpts) error {
+
+	deleteBlobSet, deleteManifestArr, deleteRepositoryArr, err := markBlobsAndManifests(ctx, storageDriver, registry,
+		opts.RemoveUntagged, opts.ModificationTimeout)
+	if err != nil {
+		return fmt.Errorf("failed to mark blobs and manifests: %v", err)
+	}
+
+	emit("\n%d blobs, %d manifests, %d repositories eligible for deletion", len(deleteBlobSet), len(deleteManifestArr), len(deleteRepositoryArr))
+
+	vacuum := NewVacuum(ctx, storageDriver)
+
+	if opts.RemoveUntagged {
+		err = sweepManifests(vacuum, deleteManifestArr, opts.DryRun)
+		if err != nil {
+			return fmt.Errorf("failed to sweep manifests: %v", err)
+		}
+	}
+
+	if opts.RemoveRepositories {
+		err = sweepRepositories(vacuum, deleteRepositoryArr, opts.DryRun)
+		if err != nil {
+			return fmt.Errorf("failed to sweep manifests: %v", err)
+		}
+	}
+
+	err = sweepBlobs(vacuum, deleteBlobSet, opts.DryRun)
+	if err != nil {
+		return fmt.Errorf("failed to sweep blobs: %v", err)
+	}
+
+	return err
+}
+
+func sweepRepositories(vacuum Vacuum, deleteRepositoryArr []string, dryRun bool) error {
+	for _, name := range deleteRepositoryArr {
+		emit("repository eligible for deletion: %s", name)
+		if dryRun {
+			continue
+		}
+		err := vacuum.RemoveRepository(name)
+		if err != nil {
+			return fmt.Errorf("failed to delete repository %s: %v", name, err)
+		}
+	}
+	return nil
+}
+
+func sweepBlobs(vacuum Vacuum, deleteBlobSet map[digest.Digest]struct{}, dryRun bool) error {
+	for dgst := range deleteBlobSet {
+		emit("blob eligible for deletion: %s", dgst)
+		if dryRun {
+			continue
+		}
+		err := vacuum.RemoveBlob(string(dgst))
+		if err != nil {
+			return fmt.Errorf("failed to delete blob %s: %v", dgst, err)
+		}
+	}
+	return nil
+}
+
+func sweepManifests(vacuum Vacuum, deleteManifestArr []ManifestDel, dryRun bool) error {
+	for _, obj := range deleteManifestArr {
+		emit("manifest eligible for deletion: %s %s", obj.Name, obj.Digest)
+		if dryRun {
+			continue
+		}
+		err := vacuum.RemoveManifest(obj.Name, obj.Digest, obj.Tags)
+		if err != nil {
+			return fmt.Errorf("failed to delete manifest %s: %v", obj.Digest, err)
+		}
+	}
+	return nil
+}
+
+func markBlobsAndManifests(
+	ctx context.Context,
+	storageDriver driver.StorageDriver,
+	registry distribution.Namespace,
+	removeUntagged bool,
+	modificationTimeout float64,
+) (map[digest.Digest]struct{}, []ManifestDel, []string, error) {
 	repositoryEnumerator, ok := registry.(distribution.RepositoryEnumerator)
 	if !ok {
-		return fmt.Errorf("unable to convert Namespace to RepositoryEnumerator")
+		return nil, nil, nil, fmt.Errorf("unable to convert Namespace to RepositoryEnumerator")
 	}
 
 	// mark
-	markSet := make(map[digest.Digest]struct{})
-	manifestArr := make([]ManifestDel, 0)
+	markBlobSet := make(map[digest.Digest]struct{})
+	deleteManifestArr := make([]ManifestDel, 0)
+	deleteRepositoryArr := make([]string, 0)
+
 	err := repositoryEnumerator.Enumerate(ctx, func(repoName string) error {
 		emit(repoName)
 
+		repoHasManifest := false
 		var err error
 		named, err := reference.WithName(repoName)
 		if err != nil {
@@ -61,7 +150,7 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 		}
 
 		err = manifestEnumerator.Enumerate(ctx, func(dgst digest.Digest) error {
-			if opts.RemoveUntagged {
+			if removeUntagged {
 				// fetch all tags where this manifest is the latest one
 				tags, err := repository.Tags(ctx).Lookup(ctx, distribution.Descriptor{Digest: dgst})
 				if err != nil {
@@ -76,13 +165,23 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 					if err != nil {
 						return fmt.Errorf("failed to retrieve tags %v", err)
 					}
-					manifestArr = append(manifestArr, ManifestDel{Name: repoName, Digest: dgst, Tags: allTags})
-					return nil
+
+					// check modification
+					modifiedEarlier, err := manifestModifiedEarlierThan(ctx, storageDriver, repoName, dgst, modificationTimeout)
+					if err != nil {
+						return fmt.Errorf("failed to get modification time %v", err)
+					}
+
+					if modifiedEarlier {
+						deleteManifestArr = append(deleteManifestArr, ManifestDel{Name: repoName, Digest: dgst, Tags: allTags})
+						return nil
+					}
 				}
 			}
+
 			// Mark the manifest's blob
 			emit("%s: marking manifest %s ", repoName, dgst)
-			markSet[dgst] = struct{}{}
+			markBlobSet[dgst] = struct{}{}
 
 			manifest, err := manifestService.Get(ctx, dgst)
 			if err != nil {
@@ -91,9 +190,11 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 
 			descriptors := manifest.References()
 			for _, descriptor := range descriptors {
-				markSet[descriptor.Digest] = struct{}{}
+				markBlobSet[descriptor.Digest] = struct{}{}
 				emit("%s: marking blob %s", repoName, descriptor.Digest)
 			}
+
+			repoHasManifest = true
 
 			return nil
 		})
@@ -107,46 +208,108 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 			return nil
 		}
 
+		if !repoHasManifest {
+			modifiedEarlier, err := repositoryModifiedEarlierThan(ctx, storageDriver, repoName, modificationTimeout)
+			if err != nil {
+				return fmt.Errorf("failed to get modification time %v", err)
+			}
+			if modifiedEarlier {
+				deleteRepositoryArr = append(deleteRepositoryArr, repoName)
+			}
+		}
+
 		return err
 	})
 
 	if err != nil {
-		return fmt.Errorf("failed to mark: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to mark: %v", err)
 	}
 
-	// sweep
-	vacuum := NewVacuum(ctx, storageDriver)
-	if !opts.DryRun {
-		for _, obj := range manifestArr {
-			err = vacuum.RemoveManifest(obj.Name, obj.Digest, obj.Tags)
-			if err != nil {
-				return fmt.Errorf("failed to delete manifest %s: %v", obj.Digest, err)
-			}
-		}
-	}
 	blobService := registry.Blobs()
-	deleteSet := make(map[digest.Digest]struct{})
+	deleteBlobSet := make(map[digest.Digest]struct{})
 	err = blobService.Enumerate(ctx, func(dgst digest.Digest) error {
 		// check if digest is in markSet. If not, delete it!
-		if _, ok := markSet[dgst]; !ok {
-			deleteSet[dgst] = struct{}{}
+		if _, ok := markBlobSet[dgst]; !ok {
+			// check modification
+			modifiedEarlier, err := blobModifiedEarlierThan(ctx, storageDriver, dgst, modificationTimeout)
+			if err != nil {
+				return fmt.Errorf("failed to get modification time: %v", err)
+			}
+
+			if modifiedEarlier {
+				deleteBlobSet[dgst] = struct{}{}
+			}
 		}
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("error enumerating blobs: %v", err)
-	}
-	emit("\n%d blobs marked, %d blobs and %d manifests eligible for deletion", len(markSet), len(deleteSet), len(manifestArr))
-	for dgst := range deleteSet {
-		emit("blob eligible for deletion: %s", dgst)
-		if opts.DryRun {
-			continue
-		}
-		err = vacuum.RemoveBlob(string(dgst))
-		if err != nil {
-			return fmt.Errorf("failed to delete blob %s: %v", dgst, err)
-		}
+		return nil, nil, nil, fmt.Errorf("error enumerating blobs: %v", err)
 	}
 
-	return err
+	return deleteBlobSet, deleteManifestArr, deleteRepositoryArr, nil
+}
+
+// RepositoryModifiedEarlierThan returns repository was modified more than timeout seconds ago
+func repositoryModifiedEarlierThan(
+	ctx context.Context,
+	strorageDriver driver.StorageDriver,
+	repoName string,
+	timeout float64,
+) (bool, error) {
+	rootForRepository, err := pathFor(repositoriesRootPathSpec{})
+	if err != nil {
+		return false, err
+	}
+	repoDir := path.Join(rootForRepository, repoName)
+	return pathModifiedEarlierThan(ctx, strorageDriver, repoDir, timeout)
+}
+
+// manifestModifiedEarlierThan returns manifest was modified more than timeout seconds ago
+func manifestModifiedEarlierThan(
+	ctx context.Context,
+	strorageDriver driver.StorageDriver,
+	repoName string,
+	revision digest.Digest,
+	timeout float64,
+) (bool, error) {
+	return pathSpecModifiedEarlierThan(ctx, strorageDriver, manifestRevisionPathSpec{name: repoName, revision: revision}, timeout)
+}
+
+// blobModifiedEarlierThan returns blob was modified more than timeout seconds ago
+func blobModifiedEarlierThan(
+	ctx context.Context,
+	strorageDriver driver.StorageDriver,
+	digest digest.Digest,
+	timeout float64,
+) (bool, error) {
+	return pathSpecModifiedEarlierThan(ctx, strorageDriver, blobPathSpec{digest: digest}, timeout)
+}
+
+// pathSpecModifiedEarlierThan returns pathSpec file was modified more than timeout seconds ago
+func pathSpecModifiedEarlierThan(
+	ctx context.Context,
+	strorageDriver driver.StorageDriver,
+	spec pathSpec,
+	timeout float64,
+) (bool, error) {
+	path, err := pathFor(spec)
+	if err != nil {
+		return false, err
+	}
+	return pathModifiedEarlierThan(ctx, strorageDriver, path, timeout)
+}
+
+// pathModifiedEarlierThan returns path was modified more than timeout seconds ago
+func pathModifiedEarlierThan(ctx context.Context, strorageDriver driver.StorageDriver, path string, timeout float64) (bool, error) {
+	if timeout <= 0 {
+		return true, nil
+	}
+	stat, err := strorageDriver.Stat(ctx, path)
+	if err != nil {
+		return false, err
+	}
+	mtime := stat.ModTime()
+	since := time.Since(mtime)
+	seconds := since.Seconds()
+	return seconds > timeout, nil
 }

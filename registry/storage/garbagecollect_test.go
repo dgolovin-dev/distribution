@@ -4,6 +4,7 @@ import (
 	"io"
 	"path"
 	"testing"
+	"time"
 
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/context"
@@ -499,4 +500,152 @@ func TestOrphanBlobDeleted(t *testing.T) {
 			t.Fatalf("Orphan layer is present: %v", dgst)
 		}
 	}
+}
+
+func testModificationTimeout(t *testing.T, dryRun bool, removeUntagged bool, removeRepo bool) {
+	startTime := time.Now()
+
+	ctx := context.Background()
+	inmemoryDriver := inmemory.New()
+
+	registry := createRegistry(t, inmemoryDriver)
+	repo := makeRepository(t, registry, "deletemodtimeout")
+	manifestService, _ := repo.Manifests(ctx)
+
+	// Create random layers
+	randomLayers1, err := testutil.CreateRandomLayers(5)
+	if err != nil {
+		t.Fatalf("failed to make layers: %v", err)
+	}
+	randomLayers2, err := testutil.CreateRandomLayers(3)
+	if err != nil {
+		t.Fatalf("failed to make layers: %v", err)
+	}
+
+	// Upload all layers
+	err = testutil.UploadBlobs(repo, randomLayers1)
+	if err != nil {
+		t.Fatalf("failed to upload layers: %v", err)
+	}
+	err = testutil.UploadBlobs(repo, randomLayers2)
+	if err != nil {
+		t.Fatalf("failed to upload layers: %v", err)
+	}
+
+	// Construct manifest
+	manifest1, err := testutil.MakeSchema1Manifest(getKeys(randomLayers1))
+	if err != nil {
+		t.Fatalf("failed to make manifest: %v", err)
+	}
+
+	_, err = manifestService.Put(ctx, manifest1)
+	if err != nil {
+		t.Fatalf("manifest upload failed: %v", err)
+	}
+
+	manifestEnumerator, _ := manifestService.(distribution.ManifestEnumerator)
+	manifestEnumerator.Enumerate(ctx, func(dgst digest.Digest) error {
+		repo.Tags(ctx).Tag(ctx, "test", distribution.Descriptor{Digest: dgst})
+		return nil
+	})
+
+	// untag it
+	repo.Tags(ctx).Untag(ctx, "test")
+
+	before1 := allBlobs(t, registry)
+	before2 := allManifests(t, manifestService)
+
+	time.Sleep(10 * time.Millisecond)
+	preparationCompleteTime := time.Now()
+	time.Sleep(10 * time.Millisecond)
+
+	// run GC with modification timeout (should not remove anything)
+	err = MarkAndSweep(context.Background(), inmemoryDriver, registry, GCOpts{
+		DryRun:              dryRun,
+		RemoveUntagged:      removeUntagged,
+		RemoveRepositories:  removeRepo,
+		ModificationTimeout: time.Since(startTime).Seconds() + 5,
+	})
+	if err != nil {
+		t.Fatalf("Failed mark and sweep: %v", err)
+	}
+
+	afterMt1 := allBlobs(t, registry)
+	afterMt2 := allManifests(t, manifestService)
+	if len(before1) != len(afterMt1) {
+		t.Fatalf("Garbage collection affected blobs storage: %d != %d", len(before1), len(afterMt1))
+	}
+	if len(before2) != len(afterMt2) {
+		t.Fatalf("Garbage collection affected manifest storage: %d != %d", len(before2), len(afterMt2))
+	}
+
+	// run GC with modification timeout after delay
+	err = MarkAndSweep(context.Background(), inmemoryDriver, registry, GCOpts{
+		DryRun:              dryRun,
+		RemoveUntagged:      removeUntagged,
+		RemoveRepositories:  removeRepo,
+		ModificationTimeout: time.Since(preparationCompleteTime).Seconds(),
+	})
+	if err != nil {
+		t.Fatalf("Failed mark and sweep: %v", err)
+	}
+
+	repoExists := false
+	repositoryEnumerator := registry.(distribution.RepositoryEnumerator)
+	repositoryEnumerator.Enumerate(ctx, func(repoName string) error {
+		if !dryRun && removeUntagged && removeRepo {
+			t.Fatalf("Repository still exists %s", repoName)
+		}
+		repoExists = true
+		return nil
+	})
+
+	if !repoExists && !(!dryRun && removeUntagged && removeRepo) {
+		t.Fatalf("Repository removed")
+	}
+
+	after1 := allBlobs(t, registry)
+	after2 := make(map[digest.Digest]struct{})
+	if repoExists {
+		after2 = allManifests(t, manifestService)
+	}
+	if dryRun {
+		if len(after1) != len(before1) {
+			t.Fatalf("Blobs count incorrect: %d != %d", len(after1), len(before1))
+		}
+		if len(after2) != len(before2) {
+			t.Fatalf("Manifests were affected: %d != %d", len(after2), len(before2))
+		}
+	} else if !removeUntagged {
+		if len(after1) == len(randomLayers1) {
+			t.Fatalf("Blobs count incorrect: %d != %d", len(after1), len(randomLayers1))
+		}
+		if len(after2) != len(before2) {
+			t.Fatalf("Manifest was deleted")
+		}
+	} else {
+		if len(after1) != 0 {
+			t.Fatalf("Blobs count incorrect: %d != 0", len(after1))
+		}
+		if len(after2) != 0 {
+			t.Fatalf("Manifests was not deleted")
+		}
+
+	}
+}
+
+func TestModificationTimeoutWithDryRunUntaggedAndRepo(t *testing.T) {
+	testModificationTimeout(t, true, true, true)
+}
+
+func TestModificationTimeoutWithoutDryRunUntaggedAndRepo(t *testing.T) {
+	testModificationTimeout(t, false, false, false)
+}
+
+func TestModificationTimeoutWithoutDryRunWithUntaggedWithoutRepo(t *testing.T) {
+	testModificationTimeout(t, false, true, false)
+}
+
+func TestModificationTimeoutWithoutDryRunWithUntaggedAndRepo(t *testing.T) {
+	testModificationTimeout(t, false, true, true)
 }
