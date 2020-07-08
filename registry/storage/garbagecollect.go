@@ -34,7 +34,13 @@ type ManifestDel struct {
 // MarkAndSweep performs a mark and sweep of registry data
 func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, registry distribution.Namespace, opts GCOpts) error {
 
-	deleteBlobSet, deleteManifestArr, deleteLayerMap, deleteRepositoryArr, err := mark(ctx, storageDriver, registry, opts.RemoveUntagged, opts.ModificationTimeout)
+	deleteBlobSet, deleteManifestArr, deleteLayerMap, deleteRepositoryArr, err := mark(
+		ctx,
+		storageDriver,
+		registry,
+		opts.RemoveUntagged,
+		opts.ModificationTimeout,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to mark blobs and manifests: %v", err)
 	}
