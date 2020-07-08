@@ -45,7 +45,7 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 	}
 
 	emit(
-		"\n%d blobs, %d manifests, %layers, %d repositories eligible for deletion",
+		"\n%d blobs, %d manifests, %d layers, %d repositories eligible for deletion",
 		len(deleteBlobSet),
 		len(deleteManifestArr),
 		deleteLayerCount,
