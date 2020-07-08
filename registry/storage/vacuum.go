@@ -39,7 +39,7 @@ func (v Vacuum) RemoveLayer(repoName string, dgst digest.Digest) error {
 
 	dcontext.GetLogger(v.ctx).Infof("Deleting layer: %s", layerDir)
 
-	err = v.driver.Delete(v.ctx, layerLinkPath)
+	err = v.driver.Delete(v.ctx, layerDir)
 	if err != nil {
 		return err
 	}
