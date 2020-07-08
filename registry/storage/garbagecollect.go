@@ -57,25 +57,28 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 	if opts.RemoveUntagged {
 		err = sweepManifests(vacuum, deleteManifestArr, opts.DryRun)
 		if err != nil {
-			return fmt.Errorf("failed to sweep manifests: %v", err)
+			return err
 		}
 	}
 
-	sweepLayers(vacuum, deleteLayerMap, opts.DryRun)
+	err = sweepLayers(vacuum, deleteLayerMap, opts.DryRun)
+	if err != nil {
+		return err
+	}
 
 	if opts.RemoveRepositories {
 		err = sweepRepositories(vacuum, deleteRepositoryArr, opts.DryRun)
 		if err != nil {
-			return fmt.Errorf("failed to sweep repositories: %v", err)
+			return err
 		}
 	}
 
 	err = sweepBlobs(vacuum, deleteBlobSet, opts.DryRun)
 	if err != nil {
-		return fmt.Errorf("failed to sweep blobs: %v", err)
+		return err
 	}
 
-	return err
+	return nil
 }
 
 func sweepRepositories(vacuum Vacuum, deleteRepositoryArr []string, dryRun bool) error {
@@ -171,6 +174,7 @@ func mark(
 	removeUntagged bool,
 	modificationTimeout float64,
 ) (map[digest.Digest]struct{}, []ManifestDel, map[string][]digest.Digest, []string, error) {
+
 	modTimeoutDuration := time.Duration(float64(time.Second) * modificationTimeout)
 	maxModified := time.Now().Add(-modTimeoutDuration)
 
@@ -226,6 +230,7 @@ func mark(
 						return fmt.Errorf("failed to retrieve tags %v", err)
 					}
 
+					manifestModifiedEarlier := true
 					// check modification
 					if modificationTimeout > 0 {
 						modified, err := manifestModified(ctx, storageDriver, repoName, dgst)
@@ -233,12 +238,14 @@ func mark(
 							return fmt.Errorf("failed to get modification time: %v", err)
 						}
 						if maxModified.Before(modified) {
-							return nil
+							manifestModifiedEarlier = false
 						}
 					}
 
-					deleteManifestArr = append(deleteManifestArr, ManifestDel{Name: repoName, Digest: dgst, Tags: allTags})
-					return nil
+					if manifestModifiedEarlier {
+						deleteManifestArr = append(deleteManifestArr, ManifestDel{Name: repoName, Digest: dgst, Tags: allTags})
+						return nil
+					}
 				}
 			}
 
@@ -299,12 +306,13 @@ func mark(
 			return nil
 		})
 		if err != nil {
-			return fmt.Errorf("failed to get layers %v", err)
+			return fmt.Errorf("failed to get layers: %v", err)
 		}
 		if len(deleteLayerArr) > 0 {
 			deleteLayerMap[repoName] = deleteLayerArr
 		}
 
+		// mark repo for deletion if it does not contain manifests
 		if repoHasManifest {
 			return nil
 		}
@@ -323,7 +331,6 @@ func mark(
 
 		return nil
 	})
-
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("failed to mark: %v", err)
 	}
@@ -332,19 +339,20 @@ func mark(
 	deleteBlobSet := make(map[digest.Digest]struct{})
 	err = blobService.Enumerate(ctx, func(dgst digest.Digest) error {
 		// check if digest is in markSet. If not, delete it!
-		if _, ok := markBlobSet[dgst]; !ok {
-			// check modification
-			if modificationTimeout > 0 {
-				modified, err := blobModified(ctx, storageDriver, dgst)
-				if err != nil {
-					return fmt.Errorf("failed to get modification time: %v", err)
-				}
-				if maxModified.Before(modified) {
-					return nil
-				}
-			}
-			deleteBlobSet[dgst] = struct{}{}
+		if _, ok := markBlobSet[dgst]; ok {
+			return nil
 		}
+		// check modification
+		if modificationTimeout > 0 {
+			modified, err := blobModified(ctx, storageDriver, dgst)
+			if err != nil {
+				return fmt.Errorf("failed to get modification time: %v", err)
+			}
+			if maxModified.Before(modified) {
+				return nil
+			}
+		}
+		deleteBlobSet[dgst] = struct{}{}
 		return nil
 	})
 	if err != nil {
