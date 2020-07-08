@@ -171,6 +171,9 @@ func mark(
 	removeUntagged bool,
 	modificationTimeout float64,
 ) (map[digest.Digest]struct{}, []ManifestDel, map[string][]digest.Digest, []string, error) {
+	modTimeoutDuration := time.Duration(float64(time.Second) * modificationTimeout)
+	maxModified := time.Now().Add(-modTimeoutDuration)
+
 	repositoryEnumerator, ok := registry.(distribution.RepositoryEnumerator)
 	if !ok {
 		return nil, nil, nil, nil, fmt.Errorf("unable to convert Namespace to RepositoryEnumerator")
@@ -205,7 +208,7 @@ func mark(
 			return fmt.Errorf("unable to convert ManifestService into ManifestEnumerator")
 		}
 
-		markRepoBlobSet := make(map[digest.Digest]struct{})
+		markLayerSet := make(map[digest.Digest]struct{})
 		err = manifestEnumerator.Enumerate(ctx, func(dgst digest.Digest) error {
 			if removeUntagged {
 				// fetch all tags where this manifest is the latest one
@@ -224,15 +227,18 @@ func mark(
 					}
 
 					// check modification
-					modifiedEarlier, err := manifestModifiedEarlierThan(ctx, storageDriver, repoName, dgst, modificationTimeout)
-					if err != nil {
-						return fmt.Errorf("failed to get modification time %v", err)
+					if modificationTimeout > 0 {
+						modified, err := manifestModified(ctx, storageDriver, repoName, dgst)
+						if err != nil {
+							return fmt.Errorf("failed to get modification time: %v", err)
+						}
+						if maxModified.Before(modified) {
+							return nil
+						}
 					}
 
-					if modifiedEarlier {
-						deleteManifestArr = append(deleteManifestArr, ManifestDel{Name: repoName, Digest: dgst, Tags: allTags})
-						return nil
-					}
+					deleteManifestArr = append(deleteManifestArr, ManifestDel{Name: repoName, Digest: dgst, Tags: allTags})
+					return nil
 				}
 			}
 
@@ -248,7 +254,7 @@ func mark(
 			descriptors := manifest.References()
 			for _, descriptor := range descriptors {
 				markBlobSet[descriptor.Digest] = struct{}{}
-				markRepoBlobSet[descriptor.Digest] = struct{}{}
+				markLayerSet[descriptor.Digest] = struct{}{}
 				emit("%s: marking blob %s", repoName, descriptor.Digest)
 			}
 
@@ -275,10 +281,21 @@ func mark(
 
 		deleteLayerArr := make([]digest.Digest, 0)
 		err = blobEnumerator.Enumerate(ctx, func(dgst digest.Digest) error {
-			if _, ok := markRepoBlobSet[dgst]; !ok {
-				emit("%s: unused layer %s", repoName, dgst)
-				deleteLayerArr = append(deleteLayerArr, dgst)
+			if _, ok := markLayerSet[dgst]; ok {
+				return nil
 			}
+			// check modification
+			if modificationTimeout > 0 {
+				modified, err := layerModified(ctx, storageDriver, repoName, dgst)
+				if err != nil {
+					return fmt.Errorf("failed to get modification time: %v", err)
+				}
+				if maxModified.Before(modified) {
+					return nil
+				}
+			}
+			emit("%s: unused layer %s", repoName, dgst)
+			deleteLayerArr = append(deleteLayerArr, dgst)
 			return nil
 		})
 		if err != nil {
@@ -288,17 +305,23 @@ func mark(
 			deleteLayerMap[repoName] = deleteLayerArr
 		}
 
-		if !repoHasManifest {
-			modifiedEarlier, err := repositoryModifiedEarlierThan(ctx, storageDriver, repoName, modificationTimeout)
+		if repoHasManifest {
+			return nil
+		}
+		// check modification
+		if modificationTimeout > 0 {
+			modified, err := repositoryModified(ctx, storageDriver, repoName)
 			if err != nil {
-				return fmt.Errorf("failed to get modification time %v", err)
+				return fmt.Errorf("failed to get modification time: %v", err)
 			}
-			if modifiedEarlier {
-				deleteRepositoryArr = append(deleteRepositoryArr, repoName)
+			if maxModified.Before(modified) {
+				return nil
 			}
 		}
+		deleteRepositoryArr = append(deleteRepositoryArr, repoName)
+		emit("%s: empty repo", repoName)
 
-		return err
+		return nil
 	})
 
 	if err != nil {
@@ -311,14 +334,16 @@ func mark(
 		// check if digest is in markSet. If not, delete it!
 		if _, ok := markBlobSet[dgst]; !ok {
 			// check modification
-			modifiedEarlier, err := blobModifiedEarlierThan(ctx, storageDriver, dgst, modificationTimeout)
-			if err != nil {
-				return fmt.Errorf("failed to get modification time: %v", err)
+			if modificationTimeout > 0 {
+				modified, err := blobModified(ctx, storageDriver, dgst)
+				if err != nil {
+					return fmt.Errorf("failed to get modification time: %v", err)
+				}
+				if maxModified.Before(modified) {
+					return nil
+				}
 			}
-
-			if modifiedEarlier {
-				deleteBlobSet[dgst] = struct{}{}
-			}
+			deleteBlobSet[dgst] = struct{}{}
 		}
 		return nil
 	})
@@ -329,62 +354,61 @@ func mark(
 	return deleteBlobSet, deleteManifestArr, deleteLayerMap, deleteRepositoryArr, nil
 }
 
-func repositoryModifiedEarlierThan(
+func repositoryModified(
 	ctx context.Context,
 	strorageDriver driver.StorageDriver,
 	repoName string,
-	timeout float64,
-) (bool, error) {
+) (time.Time, error) {
 	rootForRepository, err := pathFor(repositoriesRootPathSpec{})
 	if err != nil {
-		return false, err
+		return time.Now(), err
 	}
 	repoDir := path.Join(rootForRepository, repoName)
-	return pathModifiedEarlierThan(ctx, strorageDriver, repoDir, timeout)
+	return pathModified(ctx, strorageDriver, repoDir)
 }
 
-func manifestModifiedEarlierThan(
+func manifestModified(
 	ctx context.Context,
 	strorageDriver driver.StorageDriver,
 	repoName string,
 	revision digest.Digest,
-	timeout float64,
-) (bool, error) {
-	return pathSpecModifiedEarlierThan(ctx, strorageDriver, manifestRevisionPathSpec{name: repoName, revision: revision}, timeout)
+) (time.Time, error) {
+	return pathSpecModified(ctx, strorageDriver, manifestRevisionPathSpec{name: repoName, revision: revision})
 }
 
-func blobModifiedEarlierThan(
+func blobModified(
 	ctx context.Context,
 	strorageDriver driver.StorageDriver,
 	digest digest.Digest,
-	timeout float64,
-) (bool, error) {
-	return pathSpecModifiedEarlierThan(ctx, strorageDriver, blobPathSpec{digest: digest}, timeout)
+) (time.Time, error) {
+	return pathSpecModified(ctx, strorageDriver, blobPathSpec{digest: digest})
 }
 
-func pathSpecModifiedEarlierThan(
+func layerModified(
+	ctx context.Context,
+	strorageDriver driver.StorageDriver,
+	repoName string,
+	digest digest.Digest,
+) (time.Time, error) {
+	return pathSpecModified(ctx, strorageDriver, layerLinkPathSpec{name: repoName, digest: digest})
+}
+
+func pathSpecModified(
 	ctx context.Context,
 	strorageDriver driver.StorageDriver,
 	spec pathSpec,
-	timeout float64,
-) (bool, error) {
+) (time.Time, error) {
 	path, err := pathFor(spec)
 	if err != nil {
-		return false, err
+		return time.Now(), err
 	}
-	return pathModifiedEarlierThan(ctx, strorageDriver, path, timeout)
+	return pathModified(ctx, strorageDriver, path)
 }
 
-func pathModifiedEarlierThan(ctx context.Context, strorageDriver driver.StorageDriver, path string, timeout float64) (bool, error) {
-	if timeout <= 0 {
-		return true, nil
-	}
+func pathModified(ctx context.Context, strorageDriver driver.StorageDriver, path string) (time.Time, error) {
 	stat, err := strorageDriver.Stat(ctx, path)
 	if err != nil {
-		return false, err
+		return time.Now(), err
 	}
-	mtime := stat.ModTime()
-	since := time.Since(mtime)
-	seconds := since.Seconds()
-	return seconds > timeout, nil
+	return stat.ModTime(), nil
 }
